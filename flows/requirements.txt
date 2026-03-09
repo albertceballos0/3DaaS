@@ -1,0 +1,12 @@
+# Prefect orchestration
+prefect>=2.19,<3.0
+
+# GCP SDKs
+google-cloud-aiplatform>=1.55.0
+google-cloud-storage>=2.16.0
+
+# Environment variables
+python-dotenv>=1.0.0
+
+# HTTP (webhook notifications)
+requests>=2.31.0

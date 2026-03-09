@@ -1,0 +1,17 @@
+# Environment — never commit secrets
+.env
+
+# GCP service account key files
+*.json
+!specs/*.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+.pytest_cache/
+
+# macOS 
+.DS_Store

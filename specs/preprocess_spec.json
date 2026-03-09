@@ -1,0 +1,19 @@
+{
+    "workerPoolSpecs": [
+        {
+            "machineSpec": {
+                "machineType": "n1-highmem-16"
+            },
+            "replicaCount": "1",
+            "containerSpec": {
+                "imageUri": "us-central1-docker.pkg.dev/skillful-air-480018-f2/nerfstudio-repo/image-preprocess:v2",
+                "env": [
+                    {
+                        "name": "QT_QPA_PLATFORM",
+                        "value": "offscreen"
+                    }
+                ]
+            }
+        }
+    ]
+}

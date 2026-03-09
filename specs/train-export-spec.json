@@ -1,0 +1,21 @@
+{
+    "workerPoolSpecs": [
+        {
+            "machineSpec": {
+                "machineType": "g2-standard-12",
+                "acceleratorType": "NVIDIA_L4",
+                "acceleratorCount": 1
+            },
+            "replicaCount": "1",
+            "containerSpec": {
+                "imageUri": "us-central1-docker.pkg.dev/skillful-air-480018-f2/nerfstudio-repo/image-train-l4:v1",
+                "env": [
+                    {
+                        "name": "QT_QPA_PLATFORM",
+                        "value": "offscreen"
+                    }
+                ]
+            }
+        }
+    ]
+}
