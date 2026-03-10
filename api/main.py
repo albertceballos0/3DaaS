@@ -17,6 +17,7 @@ Run:
 
 from __future__ import annotations
 
+import asyncio
 import os
 import sys
 import uuid
@@ -117,6 +118,11 @@ def get_run(run_id: str):
 # ── Background worker ─────────────────────────────────────────────────────────
 
 def _execute_pipeline(run_id: str, req: PipelineRequest) -> None:
+    # Prefect uses anyio internally. Running a @flow from a daemon thread that
+    # shares FastAPI's asyncio event loop causes CancelledError when the HTTP
+    # request completes. Give this thread its own isolated event loop.
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
     db.update_run(run_id, {"status": "running"})
     try:
         ply_uri = gaussian_pipeline(
@@ -135,3 +141,6 @@ def _execute_pipeline(run_id: str, req: PipelineRequest) -> None:
             "error":        str(exc),
             "completed_at": datetime.utcnow().isoformat() + "Z",
         })
+    finally:
+        loop.close()
+        asyncio.set_event_loop(None)
