@@ -1,0 +1,45 @@
+# prefect.yaml
+# =============
+# Configuración de deployments para Prefect self-hosted.
+# El código ya está en el worker container — no necesita git_clone.
+#
+# Registrar deployment:
+#   prefect deploy --name prod
+#
+# Trigger manual:
+#   prefect deployment run 'gaussian-pipeline/prod' -p run_id=<uuid> -p dataset=<nombre>
+
+name: 3daas-pipeline
+prefect-version: "3.x"
+
+build: null
+push: null
+
+# El código está baked en la imagen del worker en /app
+pull:
+  - prefect.deployments.steps.set_working_directory:
+      directory: /app
+
+deployments:
+  - name: prod
+    version: "1.0"
+    tags:
+      - production
+      - vertex-ai
+      - gaussian-splatting
+    description: >
+      Pipeline 3DaaS: COLMAP preprocessing + Gaussian Splatting training en Vertex AI.
+      Cada run procesa un dataset de imagenes y produce un archivo .ply.
+
+    entrypoint: flows/pipeline.py:gaussian_pipeline
+
+    work_pool:
+      name: gcp-worker
+      work_queue_name: default
+
+    parameters:
+      skip_preprocess: false
+      preprocess_params: {}
+      train_params: {}
+
+    schedules: []
