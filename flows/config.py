@@ -52,6 +52,7 @@ class PreprocessParams:
 
 @dataclass
 class TrainParams:
+    dataparser:     str   = ""     # vacío = nerfstudio default; "dnerf-data", "blender-data"...
     max_iters:      int   = 30000
     sh_degree:      int   = 3
     num_random:     int   = 100000
