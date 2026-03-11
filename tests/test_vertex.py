@@ -1,28 +1,22 @@
 """
 tests/test_vertex.py
 ====================
-Unit tests for flows/tasks/vertex.py
+Unit tests para flows/tasks/vertex.py.
 
-Tests cover:
-  - _poll_job: terminal states, transient errors, retry behaviour
-  - submit_preprocess_job: command construction, resource name returned
-  - submit_train_job: command construction, banned flags absent
-  - wait_for_vertex_job: delegates to _poll_job correctly
+Las tasks de Prefect se invocan via .fn() para evitar la maquinaria de Prefect.
 """
 import pytest
-from unittest.mock import MagicMock, call, patch
+from unittest.mock import MagicMock
 
 from google.cloud.aiplatform_v1.types import JobState
 from google.api_core.exceptions import ServiceUnavailable, InternalServerError
 
-from flows.tasks.vertex import _poll_job, submit_preprocess_job, submit_train_job
+from flows.tasks.vertex import poll_vertex_job, submit_preprocess_job, submit_train_job
 from flows.config import PreprocessParams, TrainParams
 
-DATASET = "test_scene"
+DATASET  = "test_scene"
 RESOURCE = "projects/123/locations/us-central1/customJobs/456"
 
-
-# ── Helpers ───────────────────────────────────────────────────────────────────
 
 def make_job(state) -> MagicMock:
     job = MagicMock()
@@ -30,22 +24,20 @@ def make_job(state) -> MagicMock:
     return job
 
 
-# ── _poll_job ─────────────────────────────────────────────────────────────────
-
 class TestPollJob:
     def test_succeeds_immediately(self, mock_job_service_client):
         mock_job_service_client.get_custom_job.return_value = make_job(JobState.JOB_STATE_SUCCEEDED)
-        _poll_job(RESOURCE, poll_interval=0)  # should not raise
+        poll_vertex_job.fn(RESOURCE, poll_interval=0)
 
     def test_raises_on_failed_state(self, mock_job_service_client):
         mock_job_service_client.get_custom_job.return_value = make_job(JobState.JOB_STATE_FAILED)
         with pytest.raises(RuntimeError, match="JOB_STATE_FAILED"):
-            _poll_job(RESOURCE, poll_interval=0)
+            poll_vertex_job.fn(RESOURCE, poll_interval=0)
 
     def test_raises_on_cancelled_state(self, mock_job_service_client):
         mock_job_service_client.get_custom_job.return_value = make_job(JobState.JOB_STATE_CANCELLED)
         with pytest.raises(RuntimeError, match="JOB_STATE_CANCELLED"):
-            _poll_job(RESOURCE, poll_interval=0)
+            poll_vertex_job.fn(RESOURCE, poll_interval=0)
 
     def test_polls_until_succeeded(self, mock_job_service_client, monkeypatch):
         monkeypatch.setattr("flows.tasks.vertex.time.sleep", lambda _: None)
@@ -54,7 +46,7 @@ class TestPollJob:
             make_job(JobState.JOB_STATE_RUNNING),
             make_job(JobState.JOB_STATE_SUCCEEDED),
         ]
-        _poll_job(RESOURCE, poll_interval=1)
+        poll_vertex_job.fn(RESOURCE, poll_interval=1)
         assert mock_job_service_client.get_custom_job.call_count == 3
 
     def test_transient_service_unavailable_is_retried(self, mock_job_service_client, monkeypatch):
@@ -64,7 +56,7 @@ class TestPollJob:
             ServiceUnavailable("connection reset"),
             make_job(JobState.JOB_STATE_SUCCEEDED),
         ]
-        _poll_job(RESOURCE, poll_interval=0)
+        poll_vertex_job.fn(RESOURCE, poll_interval=0)
         assert mock_job_service_client.get_custom_job.call_count == 3
 
     def test_transient_internal_error_is_retried(self, mock_job_service_client, monkeypatch):
@@ -73,26 +65,22 @@ class TestPollJob:
             InternalServerError("server error"),
             make_job(JobState.JOB_STATE_SUCCEEDED),
         ]
-        _poll_job(RESOURCE, poll_interval=0)
+        poll_vertex_job.fn(RESOURCE, poll_interval=0)
 
     def test_new_client_created_per_iteration(self, monkeypatch):
-        """Each poll must create a fresh client to avoid stale gRPC connections."""
         clients = []
-
         def fresh_client():
             c = MagicMock()
             c.get_custom_job.return_value = make_job(JobState.JOB_STATE_SUCCEEDED)
             clients.append(c)
             return c
-
         monkeypatch.setattr("flows.tasks.vertex._job_service_client", fresh_client)
         monkeypatch.setattr("flows.tasks.vertex.time.sleep", lambda _: None)
-        _poll_job(RESOURCE, poll_interval=0)
-        assert len(clients) == 1  # one iteration → one client
+        poll_vertex_job.fn(RESOURCE, poll_interval=0)
+        assert len(clients) == 1
 
     def test_multiple_polls_each_get_fresh_client(self, monkeypatch):
         clients = []
-
         def fresh_client():
             c = MagicMock()
             if len(clients) < 2:
@@ -101,14 +89,11 @@ class TestPollJob:
                 c.get_custom_job.return_value = make_job(JobState.JOB_STATE_SUCCEEDED)
             clients.append(c)
             return c
-
         monkeypatch.setattr("flows.tasks.vertex._job_service_client", fresh_client)
         monkeypatch.setattr("flows.tasks.vertex.time.sleep", lambda _: None)
-        _poll_job(RESOURCE, poll_interval=0)
-        assert len(clients) == 3  # 3 polls → 3 distinct clients
+        poll_vertex_job.fn(RESOURCE, poll_interval=0)
+        assert len(clients) == 3
 
-
-# ── submit_preprocess_job ─────────────────────────────────────────────────────
 
 class TestSubmitPreprocessJob:
     def _make_job_mock(self, mock_aiplatform) -> MagicMock:
@@ -119,8 +104,7 @@ class TestSubmitPreprocessJob:
 
     def test_returns_resource_name(self, mock_aiplatform):
         self._make_job_mock(mock_aiplatform)
-        params = PreprocessParams()
-        result = submit_preprocess_job.fn(DATASET, params)
+        result = submit_preprocess_job.fn(DATASET, PreprocessParams())
         assert result == RESOURCE
 
     def test_job_is_submitted_with_service_account(self, mock_aiplatform):
@@ -160,8 +144,6 @@ class TestSubmitPreprocessJob:
         assert machine == "n1-highmem-16"
 
 
-# ── submit_train_job ──────────────────────────────────────────────────────────
-
 class TestSubmitTrainJob:
     def _make_job_mock(self, mock_aiplatform) -> MagicMock:
         job_mock = MagicMock()
@@ -197,7 +179,6 @@ class TestSubmitTrainJob:
         assert "ns-export gaussian-splat" in command
 
     def test_banned_flags_not_in_command(self, mock_aiplatform):
-        """refine-start-iter and refine-stop-iter do not exist in nerfstudio 1.1.5."""
         self._make_job_mock(mock_aiplatform)
         submit_train_job.fn(DATASET, TrainParams())
         _, kwargs = mock_aiplatform.CustomJob.call_args
@@ -228,3 +209,27 @@ class TestSubmitTrainJob:
         envs = {e["name"]: e["value"]
                 for e in kwargs["worker_pool_specs"][0]["container_spec"]["env"]}
         assert envs.get("TORCH_COMPILE_DISABLE") == "1"
+
+    def test_custom_data_path_overrides_default(self, mock_aiplatform):
+        self._make_job_mock(mock_aiplatform)
+        custom_path = f"/gcs/test-bucket/{DATASET}/data"
+        submit_train_job.fn(DATASET, TrainParams(), data_path=custom_path)
+        _, kwargs = mock_aiplatform.CustomJob.call_args
+        command = kwargs["worker_pool_specs"][0]["container_spec"]["command"][2]
+        assert custom_path in command
+        assert f"{DATASET}/processed" not in command
+
+    def test_dataparser_inserted_after_splatfacto(self, mock_aiplatform):
+        self._make_job_mock(mock_aiplatform)
+        submit_train_job.fn(DATASET, TrainParams(dataparser="dnerf-data"))
+        _, kwargs = mock_aiplatform.CustomJob.call_args
+        command = kwargs["worker_pool_specs"][0]["container_spec"]["command"][2]
+        assert "ns-train splatfacto dnerf-data" in command
+
+    def test_empty_dataparser_not_in_command(self, mock_aiplatform):
+        self._make_job_mock(mock_aiplatform)
+        submit_train_job.fn(DATASET, TrainParams(dataparser=""))
+        _, kwargs = mock_aiplatform.CustomJob.call_args
+        command = kwargs["worker_pool_specs"][0]["container_spec"]["command"][2]
+        # El comando debe ser "splatfacto  --data" sin argumento extra entre ellos
+        assert "splatfacto  --data" in command or "splatfacto\n  --data" in command or "splatfacto   --data" in command
