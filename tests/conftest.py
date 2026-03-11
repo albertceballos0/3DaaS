@@ -32,15 +32,6 @@ def make_blob(name: str, size: int = 1024 * 512) -> MagicMock:
 
 # ── Fixtures ──────────────────────────────────────────────────────────────────
 
-@pytest.fixture(autouse=True)
-def silence_prefect_logger(monkeypatch):
-    """Replace get_run_logger with a no-op so tasks can run outside a flow."""
-    fake_logger = MagicMock()
-    monkeypatch.setattr("flows.tasks.gcs.get_run_logger",    lambda: fake_logger, raising=False)
-    monkeypatch.setattr("flows.tasks.vertex.get_run_logger", lambda: fake_logger, raising=False)
-    return fake_logger
-
-
 @pytest.fixture()
 def mock_gcs_client(monkeypatch):
     """Patch google.cloud.storage.Client in gcs tasks and return the mock instance."""
