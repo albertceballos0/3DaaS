@@ -1,0 +1,26 @@
+# docker-compose.override.yml
+# ============================
+# Override de desarrollo — se aplica automáticamente sobre docker-compose.yml.
+# Monta el código fuente como volumen para que los cambios sean inmediatos
+# sin necesidad de reconstruir las imágenes.
+#
+# La API arranca con --reload para hot-reload automático.
+# El worker requiere reinicio manual tras cambios en flows/:
+#   docker compose restart prefect-worker
+#
+# En producción (GCE VM) este archivo NO se usa — solo docker-compose.yml.
+
+services:
+
+  prefect-worker:
+    volumes:
+      - ./flows:/app/flows
+      - ./api:/app/api
+      - ./prefect.yaml:/app/prefect.yaml
+
+  api:
+    volumes:
+      - ./api:/app/api
+      - ./flows:/app/flows
+    command: >
+      sh -c "uvicorn api.main:app --host 0.0.0.0 --port ${PORT:-8080} --reload"
