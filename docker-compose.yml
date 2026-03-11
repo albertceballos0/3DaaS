@@ -1,0 +1,91 @@
+# docker-compose.yml
+# ===================
+# Stack completo para desarrollo local y despliegue en GCE VM.
+#
+# Servicios:
+#   prefect-server  → UI + API de Prefect  (http://localhost:4200)
+#   prefect-worker  → Worker que ejecuta los flows
+#   api             → FastAPI gateway       (http://localhost:8080)
+#
+# Uso local:
+#   cp .env.example .env   # y rellena los valores
+#   docker compose up --build
+#
+# Para desarrollo (sin reconstruir la imagen en cada cambio):
+#   docker compose up --build prefect-server
+#   # En otra terminal, con hot-reload:
+#   PREFECT_API_URL=http://localhost:4200/api prefect worker start --pool gcp-worker
+#
+# Solo server + worker (sin API local):
+#   docker compose up prefect-server prefect-worker
+
+services:
+
+  # ── Prefect Server ────────────────────────────────────────────────────────────
+  prefect-server:
+    image: prefecthq/prefect:3-latest
+    command: prefect server start --host 0.0.0.0
+    ports:
+      - "4200:4200"
+    environment:
+      PREFECT_SERVER_API_HOST: "0.0.0.0"
+      PREFECT_UI_API_URL: "${PREFECT_UI_API_URL:-http://localhost:4200/api}"
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:4200/api/health')\" 2>/dev/null || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 12
+      start_period: 60s
+    volumes:
+      - prefect-data:/root/.prefect
+
+  # ── Prefect Worker ────────────────────────────────────────────────────────────
+  prefect-worker:
+    build:
+      context: .
+      dockerfile: docker-images/Dockerfile.worker
+    depends_on:
+      prefect-server:
+        condition: service_healthy
+    environment:
+      PREFECT_API_URL: "http://prefect-server:4200/api"
+      PREFECT_WORK_POOL: "gcp-worker"
+      # GCP config — cargado desde .env
+      GCP_PROJECT_ID:      "${GCP_PROJECT_ID}"
+      GCP_REGION:          "${GCP_REGION}"
+      GCS_BUCKET:          "${GCS_BUCKET}"
+      GCP_SERVICE_ACCOUNT: "${GCP_SERVICE_ACCOUNT}"
+      IMAGE_PREPROCESS:    "${IMAGE_PREPROCESS}"
+      IMAGE_TRAIN:         "${IMAGE_TRAIN}"
+      GOOGLE_APPLICATION_CREDENTIALS: "/secrets/sa-key.json"
+    volumes:
+      # Monta la service account key para autenticación GCP
+      - "${GCP_SA_KEY_PATH:-./skillful-air-480018-f2-bcb000b8c0e2.json}:/secrets/sa-key.json:ro"
+
+  # ── FastAPI Gateway ───────────────────────────────────────────────────────────
+  api:
+    build:
+      context: .
+      dockerfile: docker-images/Dockerfile.api
+    ports:
+      - "8080:8080"
+    depends_on:
+      prefect-server:
+        condition: service_healthy
+    environment:
+      GCP_PROJECT_ID:      "${GCP_PROJECT_ID}"
+      GCP_REGION:          "${GCP_REGION}"
+      GCS_BUCKET:          "${GCS_BUCKET}"
+      GCP_SERVICE_ACCOUNT: "${GCP_SERVICE_ACCOUNT}"
+      IMAGE_PREPROCESS:    "${IMAGE_PREPROCESS}"
+      IMAGE_TRAIN:         "${IMAGE_TRAIN}"
+      # Apunta al servidor Prefect local
+      PREFECT_API_URL:     "http://prefect-server:4200/api"
+      PREFECT_API_KEY:     ""
+      PREFECT_DEPLOYMENT:  "gaussian-pipeline/prod"
+      GOOGLE_APPLICATION_CREDENTIALS: "/secrets/sa-key.json"
+    volumes:
+      - "${GCP_SA_KEY_PATH:-./skillful-air-480018-f2-bcb000b8c0e2.json}:/secrets/sa-key.json:ro"
+
+volumes:
+  prefect-data:
