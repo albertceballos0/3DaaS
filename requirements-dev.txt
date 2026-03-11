@@ -1,5 +1,8 @@
 -r requirements.txt
 
+# Prefect (necesario para importar @task/@flow en tests)
+prefect>=3.0
+
 # Testing
 pytest>=8.0
 pytest-mock>=3.14
