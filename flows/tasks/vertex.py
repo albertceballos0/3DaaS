@@ -1,7 +1,7 @@
 """
 flows/tasks/vertex.py
 =====================
-Prefect tasks for submitting and polling Vertex AI Custom Jobs.
+Prefect tasks para submit y polling de Vertex AI Custom Jobs.
 """
 
 from __future__ import annotations
@@ -9,12 +9,12 @@ from __future__ import annotations
 import time
 from datetime import datetime
 
+from prefect import task
 from google.cloud import aiplatform
 from google.cloud.aiplatform_v1 import JobServiceClient
 from google.cloud.aiplatform_v1.types import JobState
 from google.api_core.client_options import ClientOptions
 from google.api_core.exceptions import ServiceUnavailable, DeadlineExceeded, InternalServerError
-from prefect import task, get_run_logger
 
 from flows.config import (
     PROJECT_ID, REGION, BUCKET, SERVICE_ACCOUNT,
@@ -22,7 +22,6 @@ from flows.config import (
     API_ENDPOINT, VERTEX_CONSOLE,
 )
 from flows.config import PreprocessParams, TrainParams
-from flows.notify import notify, notify_job_url
 
 
 def _job_service_client() -> JobServiceClient:
@@ -34,12 +33,12 @@ def _job_service_client() -> JobServiceClient:
 _TRANSIENT_ERRORS = (ServiceUnavailable, DeadlineExceeded, InternalServerError)
 
 
-def _poll_job(job_resource_name: str, poll_interval: int = 30) -> None:
-    """Block until the Vertex AI Custom Job reaches a terminal state.
+@task(name="poll-vertex-job", log_prints=True)
+def poll_vertex_job(job_resource_name: str, poll_interval: int = 30) -> None:
+    """Bloquea hasta que el Vertex AI Custom Job llegue a un estado terminal.
 
-    A fresh JobServiceClient is created on every poll to avoid stale gRPC
-    connections being reset after long idle periods (~40 min timeout).
-    Transient network errors are caught and retried transparently.
+    Crea un JobServiceClient fresco en cada poll para evitar conexiones gRPC
+    stale (timeout ~40 min). Los errores transitorios se reintentan silenciosamente.
     """
     terminal = {
         JobState.JOB_STATE_SUCCEEDED,
@@ -51,20 +50,18 @@ def _poll_job(job_resource_name: str, poll_interval: int = 30) -> None:
 
     while True:
         try:
-            # Re-create client each iteration — prevents connection-reset errors
-            # on long-running jobs (gRPC keepalive ~40 min).
             client = _job_service_client()
             job = client.get_custom_job(name=job_resource_name)
             state = job.state
         except _TRANSIENT_ERRORS as exc:
-            notify(f"Transient API error ({exc.__class__.__name__}), retrying in {poll_interval}s …", "WAIT")
+            print(f"Error transitorio ({exc.__class__.__name__}), reintentando en {poll_interval}s...")
             time.sleep(poll_interval)
             continue
 
         if state == JobState.JOB_STATE_RUNNING:
-            notify(f"Job RUNNING — next check in {poll_interval}s …", "WAIT")
+            print(f"Job RUNNING — próximo check en {poll_interval}s...")
         elif state in (JobState.JOB_STATE_QUEUED, JobState.JOB_STATE_PENDING):
-            notify(f"Job PENDING — next check in {poll_interval}s …", "WAIT")
+            print(f"Job PENDING — próximo check en {poll_interval}s...")
 
         if state in terminal:
             break
@@ -73,16 +70,17 @@ def _poll_job(job_resource_name: str, poll_interval: int = 30) -> None:
 
     if state != JobState.JOB_STATE_SUCCEEDED:
         raise RuntimeError(
-            f"Vertex AI job ended with state: {state.name}\n"
+            f"Vertex AI job terminó con estado: {state.name}\n"
             f"Job: {job_resource_name}\n"
-            f"Check logs at {VERTEX_CONSOLE}"
+            f"Ver logs: {VERTEX_CONSOLE}"
         )
 
+    print(f"Job SUCCEEDED: {job_resource_name}")
 
-@task(name="submit-preprocess-job", retries=2, retry_delay_seconds=30)
+
+@task(name="submit-preprocess-job", log_prints=True)
 def submit_preprocess_job(dataset: str, p: PreprocessParams) -> str:
-    """Build COLMAP command, submit Vertex AI Custom Job, return resource name."""
-    logger = get_run_logger()
+    """Construye comando COLMAP, submite Vertex AI Custom Job, retorna resource name."""
     job_name = f"preprocess_{dataset}_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}"
 
     skip_flag = "--skip-colmap" if p.skip_colmap else ""
@@ -121,23 +119,32 @@ def submit_preprocess_job(dataset: str, p: PreprocessParams) -> str:
     resource_name = job.resource_name
     job_id = resource_name.split("/")[-1]
 
-    notify(f"Preprocess job submitted: {job_name}", "START")
-    notify_job_url(job_id, VERTEX_CONSOLE)
-    logger.info("Preprocess job resource: %s", resource_name)
+    print(f"Preprocess job submiteado: {job_name}")
+    print(f"Monitor → {VERTEX_CONSOLE} | Job ID: {job_id}")
     return resource_name
 
 
-@task(name="submit-train-job", retries=2, retry_delay_seconds=30)
-def submit_train_job(dataset: str, t: TrainParams) -> str:
-    """Build splatfacto command, submit Vertex AI Custom Job, return resource name."""
-    logger = get_run_logger()
+@task(name="submit-train-job", log_prints=True)
+def submit_train_job(dataset: str, t: TrainParams, data_path: str | None = None) -> str:
+    """Construye comando splatfacto, submite Vertex AI Custom Job, retorna resource name.
+
+    Args:
+        dataset:   Nombre del dataset en GCS.
+        t:         Parámetros de training. t.dataparser si no es vacío se inserta
+                   justo después de ``splatfacto`` (p.ej. ``dnerf-data``).
+        data_path: Ruta absoluta al dataset dentro del contenedor. Si None, usa
+                   ``/gcs/<BUCKET>/<dataset>/processed`` (pipeline estándar post-COLMAP).
+    """
     job_name = f"train_{dataset}_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}"
+
+    resolved_path = data_path or f"/gcs/{BUCKET}/{dataset}/processed"
+    dataparser_arg = f"{t.dataparser} " if t.dataparser else ""
 
     command = (
         f"export TORCH_COMPILE_DISABLE=1 && "
         f"export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/nvidia/lib64 && "
         f"ns-train splatfacto "
-        f"  --data /gcs/{BUCKET}/{dataset}/processed "
+        f"  --data {resolved_path} "
         f"  --output-dir /tmp/outputs "
         f"  --viewer.quit-on-train-completion True "
         f"  --project-name {dataset} "
@@ -153,7 +160,8 @@ def submit_train_job(dataset: str, t: TrainParams) -> str:
         f"  --pipeline.model.refine-every {t.refine_every} "
         f"  --pipeline.model.cull-scale-thresh {t.cull_scale} "
         f"  --pipeline.model.reset-alpha-every {t.reset_alpha} "
-        f"  --pipeline.model.random-init False && "
+        f"  --pipeline.model.random-init False "
+        f"  {dataparser_arg} && "
         f"CONFIG_PATH=$(find /tmp/outputs/ -path '*/splatfacto/*/config.yml' | head -n 1) && "
         f"echo \"Config found at: $CONFIG_PATH\" && "
         f"[ -n \"$CONFIG_PATH\" ] || {{ echo 'ERROR: config.yml not found under /tmp/outputs/'; exit 1; }} && "
@@ -190,15 +198,6 @@ def submit_train_job(dataset: str, t: TrainParams) -> str:
     resource_name = job.resource_name
     job_id = resource_name.split("/")[-1]
 
-    notify(f"Train job submitted: {job_name}", "START")
-    notify_job_url(job_id, VERTEX_CONSOLE)
-    logger.info("Train job resource: %s", resource_name)
+    print(f"Train job submiteado: {job_name}")
+    print(f"Monitor → {VERTEX_CONSOLE} | Job ID: {job_id}")
     return resource_name
-
-
-@task(name="wait-for-vertex-job", retries=1, retry_delay_seconds=60)
-def wait_for_vertex_job(resource_name: str, stage: str, poll_interval: int = 30) -> None:
-    """Poll a Vertex AI job until it reaches a terminal state."""
-    notify(f"Waiting for {stage} job to complete …", "WAIT")
-    _poll_job(resource_name, poll_interval=poll_interval)
-    notify(f"{stage} job SUCCEEDED", "OK")
