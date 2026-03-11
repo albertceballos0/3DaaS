@@ -1,0 +1,41 @@
+# docker-images/Dockerfile.worker
+# =================================
+# Imagen del Prefect worker para el pipeline 3DaaS.
+# Incluye todas las dependencias GCP y el código de flows/ y api/.
+#
+# Build:
+#   docker build -f docker-images/Dockerfile.worker -t 3daas-worker:latest .
+#
+# Uso local (via docker-compose):
+#   docker compose up
+#
+# Uso en GCE VM:
+#   docker run --env-file .env \
+#     -v /path/to/sa-key.json:/secrets/sa-key.json:ro \
+#     -e GOOGLE_APPLICATION_CREDENTIALS=/secrets/sa-key.json \
+#     -e PREFECT_API_URL=http://<SERVER_IP>:4200/api \
+#     3daas-worker:latest
+
+FROM python:3.12-slim
+
+WORKDIR /app
+
+# Instalar dependencias del sistema
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Instalar dependencias Python
+COPY flows/requirements.txt flows/requirements.txt
+RUN pip install --no-cache-dir -r flows/requirements.txt
+
+# Copiar código fuente
+COPY flows/ flows/
+COPY api/ api/
+COPY prefect.yaml prefect.yaml
+
+# Script de arranque
+COPY scripts/start_worker.sh /start_worker.sh
+RUN chmod +x /start_worker.sh
+
+CMD ["/start_worker.sh"]
