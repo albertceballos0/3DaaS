@@ -2,20 +2,19 @@ name: CI / CD
 
 on:
   push:
-    branches: ["**"]
+    branches: ["master"]
   pull_request:
-    branches: ["**"]
+    branches: ["master"]
 
 env:
   PROJECT_ID: skillful-air-480018-f2
-  REGION: us-central1
-  REGISTRY: us-central1-docker.pkg.dev/skillful-air-480018-f2/nerfstudio-repo
-  IMAGE: image-api
-  SERVICE: api-3daas
-  SA_EMAIL: custom-models@skillful-air-480018-f2.iam.gserviceaccount.com
+  REGION:     us-central1
+  VM_NAME:    ${{ vars.GCE_VM_NAME }}
+  VM_ZONE:    ${{ vars.GCE_VM_ZONE }}
+  REMOTE_DIR: /home/${{ vars.GCE_VM_USER }}/3daas
 
 jobs:
-  # ── 1. Tests ────────────────────────────────────────────────────────────────
+  # ── 1. Tests ─────────────────────────────────────────────────────────────────
   test:
     name: Run tests
     runs-on: ubuntu-latest
@@ -34,21 +33,20 @@ jobs:
       - name: pytest
         run: pytest tests/ -v --tb=short
 
-  # ── 2. Build & Deploy (master branch only) ────────────────────────────────────
+  # ── 2. Deploy a GCE VM (solo en push a master) ───────────────────────────────
   deploy:
-    name: Build and deploy to Cloud Run
+    name: Deploy to GCE VM
     needs: test
     runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/master' && github.event_name == 'push'
+    if: github.event_name == 'push'
 
     permissions:
       contents: read
-      id-token: write # required for Workload Identity Federation
+      id-token: write
 
     steps:
       - uses: actions/checkout@v4
 
-      # Auth via service account key stored as GitHub secret GCP_SA_KEY
       - name: Authenticate to Google Cloud
         uses: google-github-actions/auth@v2
         with:
@@ -57,41 +55,87 @@ jobs:
       - name: Set up Cloud SDK
         uses: google-github-actions/setup-gcloud@v2
 
-      - name: Configure Docker for Artifact Registry
-        run: gcloud auth configure-docker ${{ env.REGION }}-docker.pkg.dev --quiet
-
-      - name: Build and push image
+      # Asegura que la VM está corriendo
+      - name: Start VM if stopped
         run: |
-          IMAGE_TAG=${{ env.REGISTRY }}/${{ env.IMAGE }}:${{ github.sha }}
-          docker build \
-            -f docker-images/Dockerfile.api \
-            -t "$IMAGE_TAG" \
-            -t "${{ env.REGISTRY }}/${{ env.IMAGE }}:latest" \
-            .
-          docker push "$IMAGE_TAG"
-          docker push "${{ env.REGISTRY }}/${{ env.IMAGE }}:latest"
+          STATUS=$(gcloud compute instances describe "$VM_NAME" \
+            --zone="$VM_ZONE" --project="$PROJECT_ID" \
+            --format="value(status)")
+          if [ "$STATUS" != "RUNNING" ]; then
+            echo "VM está $STATUS — iniciando..."
+            gcloud compute instances start "$VM_NAME" --zone="$VM_ZONE" --project="$PROJECT_ID"
+            sleep 20
+          fi
 
-      - name: Deploy to Cloud Run
+      # Copia el código fuente a la VM
+      - name: Sync code to VM
         run: |
-          IMAGE_TAG=${{ env.REGISTRY }}/${{ env.IMAGE }}:${{ github.sha }}
-          gcloud run deploy ${{ env.SERVICE }} \
-            --image "$IMAGE_TAG" \
-            --region ${{ env.REGION }} \
-            --platform managed \
-            --allow-unauthenticated \
-            --service-account ${{ env.SA_EMAIL }} \
-            --port 8080 \
-            --set-env-vars "\
-          GCP_PROJECT_ID=${{ env.PROJECT_ID }},\
-          GCP_REGION=${{ env.REGION }},\
-          GCS_BUCKET=bucket-saas-project,\
-          GCP_SERVICE_ACCOUNT=${{ env.SA_EMAIL }},\
-          IMAGE_PREPROCESS=us-central1-docker.pkg.dev/${{ env.PROJECT_ID }}/nerfstudio-repo/image-preprocess:v2,\
-          IMAGE_TRAIN=us-central1-docker.pkg.dev/${{ env.PROJECT_ID }}/nerfstudio-repo/image-train-l4:v1,\
-          WEBHOOK_URL=${{ secrets.WEBHOOK_URL }}"
+          gcloud compute ssh "$VM_NAME" \
+            --zone="$VM_ZONE" --project="$PROJECT_ID" \
+            --command="mkdir -p $REMOTE_DIR"
 
-      - name: Print service URL
+          gcloud compute scp --recurse --compress \
+            --zone="$VM_ZONE" --project="$PROJECT_ID" \
+            api flows scripts docker-images \
+            docker-compose.yml prefect.yaml requirements.txt \
+            "$VM_NAME:$REMOTE_DIR/"
+
+      # Escribe el .env en la VM desde los secrets de GitHub
+      - name: Write .env on VM
         run: |
-          gcloud run services describe ${{ env.SERVICE }} \
-            --region ${{ env.REGION }} \
-            --format "value(status.url)"
+          gcloud compute ssh "$VM_NAME" \
+            --zone="$VM_ZONE" --project="$PROJECT_ID" \
+            --command="cat > $REMOTE_DIR/.env << 'ENVEOF'
+          GCP_PROJECT_ID=${{ env.PROJECT_ID }}
+          GCP_REGION=${{ env.REGION }}
+          GCS_BUCKET=${{ secrets.GCS_BUCKET }}
+          GCP_SERVICE_ACCOUNT=${{ secrets.GCP_SERVICE_ACCOUNT }}
+          IMAGE_PREPROCESS=${{ secrets.IMAGE_PREPROCESS }}
+          IMAGE_TRAIN=${{ secrets.IMAGE_TRAIN }}
+          GCP_SA_KEY_PATH=
+          PREFECT_API_URL=http://localhost:4200/api
+          PREFECT_API_KEY=
+          PREFECT_DEPLOYMENT=gaussian-pipeline/prod
+          WEBHOOK_URL=${{ secrets.WEBHOOK_URL }}
+          ENVEOF"
+
+      # Instala Docker si no está (idempotente)
+      - name: Ensure Docker is installed
+        run: |
+          gcloud compute ssh "$VM_NAME" \
+            --zone="$VM_ZONE" --project="$PROJECT_ID" \
+            --command="
+              if ! docker --version > /dev/null 2>&1; then
+                curl -fsSL https://get.docker.com | sudo sh
+                sudo usermod -aG docker \$USER
+                sudo systemctl enable --now docker
+              fi
+              if ! docker compose version > /dev/null 2>&1; then
+                sudo apt-get install -y --no-install-recommends docker-compose-plugin
+              fi
+            "
+
+      # Reconstruye y reinicia el stack
+      - name: docker compose up --build -d
+        run: |
+          gcloud compute ssh "$VM_NAME" \
+            --zone="$VM_ZONE" --project="$PROJECT_ID" \
+            --command="
+              cd $REMOTE_DIR
+              docker compose pull prefect-server 2>/dev/null || true
+              docker compose up --build -d
+              docker compose ps
+            "
+
+      # Health check
+      - name: Health check
+        run: |
+          sleep 10
+          EXTERNAL_IP=$(gcloud compute instances describe "$VM_NAME" \
+            --zone="$VM_ZONE" --project="$PROJECT_ID" \
+            --format="value(networkInterfaces[0].accessConfigs[0].natIP)")
+          echo "VM IP: $EXTERNAL_IP"
+          curl -sf "http://${EXTERNAL_IP}:8080/health" && echo "API OK" || echo "API aún arrancando (normal en primer deploy)"
+          echo ""
+          echo "Prefect UI: http://${EXTERNAL_IP}:4200"
+          echo "API:        http://${EXTERNAL_IP}:8080"
