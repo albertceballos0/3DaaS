@@ -3,24 +3,67 @@ tests/test_gcs.py
 =================
 Unit tests for flows/tasks/gcs.py
 
-Each task is tested with mock GCS blobs, verifying:
-  - Happy path: correct blobs present → task succeeds
-  - Error path: required file/blobs missing → task raises
+Prefect tasks are invoked via .fn() to bypass Prefect machinery.
 """
 import pytest
-from unittest.mock import MagicMock
 
 from tests.conftest import make_blob
 
-# Import tasks (env vars already set in conftest)
 from flows.tasks.gcs import (
+    detect_dataset_type,
     validate_raw_input,
-    check_processed_exists,
     validate_processed_output,
     validate_exported_output,
 )
 
 DATASET = "test_scene"
+
+
+# ── detect_dataset_type ───────────────────────────────────────────────────────
+
+class TestDetectDatasetType:
+    def test_detects_raw_from_images(self, mock_gcs_client):
+        mock_gcs_client.list_blobs.return_value = [
+            make_blob(f"{DATASET}/raw/img_0.jpg"),
+        ]
+        assert detect_dataset_type.fn(DATASET) == "raw"
+
+    def test_detects_nerfstudio_from_transforms_json(self, mock_gcs_client):
+        mock_gcs_client.list_blobs.side_effect = [
+            [],                                                         # raw/ — no images
+            [make_blob(f"{DATASET}/data/transforms.json")],            # data/
+        ]
+        assert detect_dataset_type.fn(DATASET) == "nerfstudio"
+
+    def test_detects_dnerf_from_transforms_train_json(self, mock_gcs_client):
+        mock_gcs_client.list_blobs.side_effect = [
+            [],                                                          # raw/ — no images
+            [make_blob(f"{DATASET}/data/transforms_train.json")],       # data/
+        ]
+        assert detect_dataset_type.fn(DATASET) == "dnerf"
+
+    def test_reads_dataset_type_txt_for_subtype(self, mock_gcs_client):
+        mock_gcs_client.list_blobs.side_effect = [
+            [],
+            [
+                make_blob(f"{DATASET}/data/transforms_train.json"),
+                make_blob(f"{DATASET}/data/dataset_type.txt"),
+            ],
+        ]
+        mock_gcs_client.bucket.return_value.blob.return_value.download_as_text.return_value = "blender"
+        assert detect_dataset_type.fn(DATASET) == "blender"
+
+    def test_raises_when_no_recognizable_structure(self, mock_gcs_client):
+        mock_gcs_client.list_blobs.side_effect = [[], []]
+        with pytest.raises(ValueError, match="No se pudo detectar"):
+            detect_dataset_type.fn(DATASET)
+
+    def test_raw_takes_priority_over_data(self, mock_gcs_client):
+        # Si hay raw/ con imágenes, siempre gana aunque exista data/
+        mock_gcs_client.list_blobs.return_value = [
+            make_blob(f"{DATASET}/raw/img_0.jpg"),
+        ]
+        assert detect_dataset_type.fn(DATASET) == "raw"
 
 
 # ── validate_raw_input ────────────────────────────────────────────────────────
@@ -52,7 +95,7 @@ class TestValidateRawInput:
 
     def test_raises_when_no_images(self, mock_gcs_client):
         mock_gcs_client.list_blobs.return_value = []
-        with pytest.raises(ValueError, match="No images found"):
+        with pytest.raises(ValueError, match="No se encontraron"):
             validate_raw_input.fn(DATASET)
 
     def test_raises_when_only_non_image_files(self, mock_gcs_client):
@@ -60,7 +103,7 @@ class TestValidateRawInput:
             make_blob(f"{DATASET}/raw/README.txt"),
             make_blob(f"{DATASET}/raw/data.csv"),
         ]
-        with pytest.raises(ValueError, match="No images found"):
+        with pytest.raises(ValueError, match="No se encontraron"):
             validate_raw_input.fn(DATASET)
 
     def test_calls_correct_prefix(self, mock_gcs_client):
@@ -68,38 +111,6 @@ class TestValidateRawInput:
         validate_raw_input.fn(DATASET)
         mock_gcs_client.list_blobs.assert_called_once_with(
             "test-bucket", prefix=f"{DATASET}/raw/", max_results=500
-        )
-
-
-# ── check_processed_exists ────────────────────────────────────────────────────
-
-class TestCheckProcessedExists:
-    def test_ok_when_transforms_present(self, mock_gcs_client):
-        mock_gcs_client.list_blobs.return_value = [
-            make_blob(f"{DATASET}/processed/transforms.json"),
-            make_blob(f"{DATASET}/processed/images/img_0.jpg"),
-        ]
-        check_processed_exists.fn(DATASET)  # should not raise
-
-    def test_raises_when_transforms_missing(self, mock_gcs_client):
-        mock_gcs_client.list_blobs.return_value = [
-            make_blob(f"{DATASET}/processed/images/img_0.jpg"),
-        ]
-        with pytest.raises(FileNotFoundError, match="skip_preprocess=True"):
-            check_processed_exists.fn(DATASET)
-
-    def test_raises_when_folder_empty(self, mock_gcs_client):
-        mock_gcs_client.list_blobs.return_value = []
-        with pytest.raises(FileNotFoundError):
-            check_processed_exists.fn(DATASET)
-
-    def test_calls_correct_prefix(self, mock_gcs_client):
-        mock_gcs_client.list_blobs.return_value = [
-            make_blob(f"{DATASET}/processed/transforms.json")
-        ]
-        check_processed_exists.fn(DATASET)
-        mock_gcs_client.list_blobs.assert_called_once_with(
-            "test-bucket", prefix=f"{DATASET}/processed/"
         )
 
 
@@ -117,13 +128,22 @@ class TestValidateProcessedOutput:
         mock_gcs_client.list_blobs.return_value = [
             make_blob(f"{DATASET}/processed/images/img_0.jpg"),
         ]
-        with pytest.raises(FileNotFoundError, match="transforms.json not found"):
+        with pytest.raises(FileNotFoundError, match="transforms.json no encontrado"):
             validate_processed_output.fn(DATASET)
 
     def test_raises_when_folder_empty(self, mock_gcs_client):
         mock_gcs_client.list_blobs.return_value = []
         with pytest.raises(FileNotFoundError):
             validate_processed_output.fn(DATASET)
+
+    def test_calls_correct_prefix(self, mock_gcs_client):
+        mock_gcs_client.list_blobs.return_value = [
+            make_blob(f"{DATASET}/processed/transforms.json")
+        ]
+        validate_processed_output.fn(DATASET)
+        mock_gcs_client.list_blobs.assert_called_once_with(
+            "test-bucket", prefix=f"{DATASET}/processed/"
+        )
 
 
 # ── validate_exported_output ──────────────────────────────────────────────────
@@ -148,7 +168,7 @@ class TestValidateExportedOutput:
         mock_gcs_client.list_blobs.return_value = [
             make_blob(f"{DATASET}/exported/config.yml"),
         ]
-        with pytest.raises(FileNotFoundError, match="No .ply file found"):
+        with pytest.raises(FileNotFoundError, match="No se encontró archivo .ply"):
             validate_exported_output.fn(DATASET)
 
     def test_raises_when_folder_empty(self, mock_gcs_client):
