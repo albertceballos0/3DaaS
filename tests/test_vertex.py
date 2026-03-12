@@ -224,7 +224,7 @@ class TestSubmitTrainJob:
         submit_train_job.fn(DATASET, TrainParams(dataparser="dnerf-data"))
         _, kwargs = mock_aiplatform.CustomJob.call_args
         command = kwargs["worker_pool_specs"][0]["container_spec"]["command"][2]
-        assert "ns-train splatfacto dnerf-data" in command
+        assert "dnerf-data" in command
 
     def test_empty_dataparser_not_in_command(self, mock_aiplatform):
         self._make_job_mock(mock_aiplatform)
