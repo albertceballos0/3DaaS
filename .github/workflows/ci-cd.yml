@@ -8,9 +8,9 @@ on:
 
 env:
   PROJECT_ID: skillful-air-480018-f2
-  REGION:     us-central1
-  VM_NAME:    ${{ vars.GCE_VM_NAME }}
-  VM_ZONE:    ${{ vars.GCE_VM_ZONE }}
+  REGION: us-central1
+  VM_NAME: ${{ vars.GCE_VM_NAME }}
+  VM_ZONE: ${{ vars.GCE_VM_ZONE }}
 
 jobs:
   # ── 1. Tests ─────────────────────────────────────────────────────────────────
@@ -97,7 +97,7 @@ jobs:
           IMAGE_PREPROCESS=${{ secrets.IMAGE_PREPROCESS }}
           IMAGE_TRAIN=${{ secrets.IMAGE_TRAIN }}
           GCP_SA_KEY_PATH=
-          PREFECT_API_URL=http://localhost:4200/api
+          PREFECT_API_URL=http://136.116.117.163:4200/api
           PREFECT_API_KEY=
           PREFECT_DEPLOYMENT=gaussian-pipeline/prod
           WEBHOOK_URL=${{ secrets.WEBHOOK_URL }}
