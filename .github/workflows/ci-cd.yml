@@ -11,7 +11,6 @@ env:
   REGION:     us-central1
   VM_NAME:    ${{ vars.GCE_VM_NAME }}
   VM_ZONE:    ${{ vars.GCE_VM_ZONE }}
-  REMOTE_DIR: /home/${{ vars.GCE_VM_USER }}/3daas
 
 jobs:
   # ── 1. Tests ─────────────────────────────────────────────────────────────────
@@ -70,6 +69,11 @@ jobs:
       # Copia el código fuente a la VM
       - name: Sync code to VM
         run: |
+          REMOTE_DIR=$(gcloud compute ssh "$VM_NAME" \
+            --zone="$VM_ZONE" --project="$PROJECT_ID" \
+            --command="echo \$HOME/3daas" | tail -1)
+          echo "REMOTE_DIR=$REMOTE_DIR" >> "$GITHUB_ENV"
+
           gcloud compute ssh "$VM_NAME" \
             --zone="$VM_ZONE" --project="$PROJECT_ID" \
             --command="mkdir -p $REMOTE_DIR"
