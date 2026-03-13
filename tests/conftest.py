@@ -15,6 +15,8 @@ os.environ.setdefault("GCS_BUCKET",          "test-bucket")
 os.environ.setdefault("GCP_SERVICE_ACCOUNT", "sa@test.iam.gserviceaccount.com")
 os.environ.setdefault("IMAGE_PREPROCESS",    "gcr.io/test/preprocess:v1")
 os.environ.setdefault("IMAGE_TRAIN",         "gcr.io/test/train:v1")
+os.environ.setdefault("APP_ENV",             "local")   # → GCS_DATASET_PREFIX = "pipeline_runs_dev"
+os.environ.setdefault("LOG_DIR",             "/tmp/3daas-test-logs")
 
 import pytest
 from unittest.mock import MagicMock

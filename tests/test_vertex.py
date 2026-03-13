@@ -15,7 +15,7 @@ from flows.tasks.vertex import (
     poll_vertex_job, submit_preprocess_job, submit_train_job,
     _parse_train_progress,
 )
-from flows.config import PreprocessParams, TrainParams
+from flows.config import PreprocessParams, TrainParams, GCS_DATASET_PREFIX
 
 DATASET  = "test_scene"
 RESOURCE = "projects/123/locations/us-central1/customJobs/456"
@@ -270,8 +270,8 @@ class TestSubmitPreprocessJob:
         submit_preprocess_job.fn(DATASET, PreprocessParams())
         _, kwargs = mock_aiplatform.CustomJob.call_args
         command = kwargs["worker_pool_specs"][0]["container_spec"]["command"][2]
-        assert f"/gcs/test-bucket/{DATASET}/raw" in command
-        assert f"gs://test-bucket/{DATASET}/processed/" in command
+        assert f"/gcs/test-bucket/{GCS_DATASET_PREFIX}/{DATASET}/raw" in command
+        assert f"gs://test-bucket/{GCS_DATASET_PREFIX}/{DATASET}/processed/" in command
 
     def test_command_uses_colmap_params(self, mock_aiplatform):
         self._make_job_mock(mock_aiplatform)
@@ -314,15 +314,15 @@ class TestSubmitTrainJob:
         submit_train_job.fn(DATASET, TrainParams())
         _, kwargs = mock_aiplatform.CustomJob.call_args
         command = kwargs["worker_pool_specs"][0]["container_spec"]["command"][2]
-        assert f"/gcs/test-bucket/{DATASET}/processed" in command
+        assert f"/gcs/test-bucket/{GCS_DATASET_PREFIX}/{DATASET}/processed" in command
 
     def test_command_uploads_trained_and_exported(self, mock_aiplatform):
         self._make_job_mock(mock_aiplatform)
         submit_train_job.fn(DATASET, TrainParams())
         _, kwargs = mock_aiplatform.CustomJob.call_args
         command = kwargs["worker_pool_specs"][0]["container_spec"]["command"][2]
-        assert f"gs://test-bucket/{DATASET}/trained/" in command
-        assert f"gs://test-bucket/{DATASET}/exported/" in command
+        assert f"gs://test-bucket/{GCS_DATASET_PREFIX}/{DATASET}/trained/" in command
+        assert f"gs://test-bucket/{GCS_DATASET_PREFIX}/{DATASET}/exported/" in command
 
     def test_command_contains_ns_export(self, mock_aiplatform):
         self._make_job_mock(mock_aiplatform)
@@ -370,7 +370,7 @@ class TestSubmitTrainJob:
         _, kwargs = mock_aiplatform.CustomJob.call_args
         command = kwargs["worker_pool_specs"][0]["container_spec"]["command"][2]
         assert custom_path in command
-        assert f"{DATASET}/processed" not in command
+        assert f"{GCS_DATASET_PREFIX}/{DATASET}/processed" not in command
 
     def test_dataparser_inserted_after_splatfacto(self, mock_aiplatform):
         self._make_job_mock(mock_aiplatform)

@@ -10,8 +10,9 @@ Endpoints públicos:
   DELETE /pipeline/{run_id} → cancela el flow run en Prefect y elimina de Firestore
   GET    /health            → health check
 
-El estado del pipeline es escrito directamente en Firestore por el Prefect flow
-que corre en el worker. La API solo lee el estado y dispara nuevos runs.
+Todas las respuestas siguen el envelope estándar ApiResponse[T]:
+  { "success": true,  "data": <T>,   "error": null }
+  { "success": false, "data": null,  "error": { "code": "...", "message": "..." } }
 
 Run:
   uvicorn api.main:app --host 0.0.0.0 --port 8080
@@ -24,11 +25,12 @@ import re
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, Any, List, Optional
+from typing import Generic, List, Optional, TypeVar
 
 import requests
-from fastapi import FastAPI, HTTPException, Query
-from pydantic import BaseModel
+from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, ConfigDict
 from dotenv import load_dotenv
 
 # ── Bootstrap ─────────────────────────────────────────────────────────────────
@@ -40,12 +42,12 @@ logger = get_logger("api")
 
 import api.db as db
 
-app = FastAPI(title="3DaaS Pipeline API", version="4.0.0")
+app = FastAPI(title="3DaaS Pipeline API", version="5.0.0")
 
-PREFECT_API_URL = os.environ.get("PREFECT_API_URL", "")
-PREFECT_API_KEY = os.environ.get("PREFECT_API_KEY", "")
+PREFECT_API_URL  = os.environ.get("PREFECT_API_URL", "")
+PREFECT_API_KEY  = os.environ.get("PREFECT_API_KEY", "")
 PREFECT_DEPLOYMENT = os.environ.get("PREFECT_DEPLOYMENT", "gaussian-pipeline/prod")
-WANDB_API_KEY = os.environ.get("WANDB_API_KEY", "")
+WANDB_API_KEY    = os.environ.get("WANDB_API_KEY", "")
 
 _WANDB_RUN_RE = re.compile(r'https://wandb\.ai/([^/\s]+)/([^/\s]+)/runs/([^/\s?#]+)')
 
@@ -53,7 +55,73 @@ _WANDB_RUN_RE = re.compile(r'https://wandb\.ai/([^/\s]+)/([^/\s]+)/runs/([^/\s?#
 _LIVE_METRIC_STAGES = {"training", "preprocessing"}
 
 
-# ── Models ────────────────────────────────────────────────────────────────────
+# ── Response envelope ──────────────────────────────────────────────────────────
+
+T = TypeVar("T")
+
+
+class ErrorDetail(BaseModel):
+    code: str
+    message: str
+
+
+class ApiResponse(BaseModel, Generic[T]):
+    success: bool
+    data: Optional[T] = None
+    error: Optional[ErrorDetail] = None
+
+
+def ok(data: T) -> ApiResponse[T]:
+    return ApiResponse(success=True, data=data)
+
+
+def err(code: str, message: str) -> ApiResponse:
+    return ApiResponse(success=False, error=ErrorDetail(code=code, message=message))
+
+
+# ── Domain models ──────────────────────────────────────────────────────────────
+
+class TrainingProgress(BaseModel):
+    step: int
+    total_steps: int
+    pct: float
+    train_loss: Optional[float] = None
+
+
+class PipelineRun(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    run_id: str
+    dataset: str
+    status: str                          # queued | running | done | failed | cancelled
+    stage: Optional[str] = None
+    dataset_type: Optional[str] = None
+    image_count: Optional[int] = None
+    vertex_job_id: Optional[str] = None
+    vertex_job_state: Optional[str] = None
+    progress: Optional[TrainingProgress] = None
+    recent_logs: Optional[List[str]] = None
+    started_at: str
+    completed_at: Optional[str] = None
+    ply_uri: Optional[str] = None
+    wandb_url: Optional[str] = None
+    wandb_metrics: Optional[dict] = None
+    error: Optional[str] = None
+    params: dict
+    prefect_flow_run_id: Optional[str] = None
+
+
+class CancelResult(BaseModel):
+    run_id: str
+    cancelled_in_prefect: bool
+
+
+class HealthResponse(BaseModel):
+    status: str
+    version: str
+
+
+# ── Request models ─────────────────────────────────────────────────────────────
 
 class PipelineRequest(BaseModel):
     dataset: str
@@ -90,14 +158,34 @@ class PipelineRequest(BaseModel):
     use_wandb: bool = False
 
 
+# ── Exception handlers ─────────────────────────────────────────────────────────
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(_: Request, exc: HTTPException):
+    code = f"HTTP_{exc.status_code}"
+    return JSONResponse(
+        status_code=exc.status_code,
+        content=err(code, str(exc.detail)).model_dump(),
+    )
+
+
+@app.exception_handler(Exception)
+async def generic_exception_handler(_: Request, exc: Exception):
+    logger.error(f"Unhandled exception: {exc}", exc_info=True)
+    return JSONResponse(
+        status_code=500,
+        content=err("INTERNAL_ERROR", "An unexpected error occurred.").model_dump(),
+    )
+
+
 # ── Public routes ──────────────────────────────────────────────────────────────
 
-@app.get("/health")
+@app.get("/health", response_model=ApiResponse[HealthResponse])
 def health():
-    return {"status": "ok"}
+    return ok(HealthResponse(status="ok", version=app.version))
 
 
-@app.post("/pipeline/start", status_code=202)
+@app.post("/pipeline/start", status_code=201, response_model=ApiResponse[PipelineRun])
 def start_pipeline(req: PipelineRequest):
     run_id = str(uuid.uuid4())
     run_data = {
@@ -117,31 +205,33 @@ def start_pipeline(req: PipelineRequest):
     prefect_run_id = _trigger_prefect_flow(run_id, req)
     db.update_run(run_id, {"prefect_flow_run_id": prefect_run_id})
     logger.debug(f"Flow run de Prefect creado: {prefect_run_id} para run {run_id}")
-    return db.get_run(run_id)
+
+    run = db.get_run(run_id)
+    return ok(PipelineRun.model_validate(run))
 
 
-@app.get("/pipeline", response_model=List[Dict[str, Any]])
+@app.get("/pipeline", response_model=ApiResponse[List[PipelineRun]])
 def list_runs(limit: int = Query(default=100, ge=1, le=500)):
-    return db.list_runs(limit=limit)
+    runs = [PipelineRun.model_validate(r) for r in db.list_runs(limit=limit)]
+    return ok(runs)
 
 
-@app.get("/pipeline/{run_id}")
+@app.get("/pipeline/{run_id}", response_model=ApiResponse[PipelineRun])
 def get_run(run_id: str):
     run = db.get_run(run_id)
     if not run:
-        raise HTTPException(status_code=404, detail="Run not found")
+        raise HTTPException(status_code=404, detail=f"Run '{run_id}' not found.")
     if run.get("stage") in _LIVE_METRIC_STAGES:
         run = _enrich_with_live_metrics(run)
-    return run
+    return ok(PipelineRun.model_validate(run))
 
 
-@app.delete("/pipeline/{run_id}", status_code=200)
+@app.delete("/pipeline/{run_id}", status_code=200, response_model=ApiResponse[CancelResult])
 def cancel_run(run_id: str):
     run = db.get_run(run_id)
     if not run:
-        raise HTTPException(status_code=404, detail="Run not found")
+        raise HTTPException(status_code=404, detail=f"Run '{run_id}' not found.")
 
-    # Cancelar en Prefect si hay un flow run asociado y aún está activo
     prefect_flow_run_id = run.get("prefect_flow_run_id")
     cancelled_in_prefect = False
     if prefect_flow_run_id and run.get("status") not in ("done", "failed", "cancelled"):
@@ -153,17 +243,12 @@ def cancel_run(run_id: str):
         "error":        "Cancelled by user",
     })
     logger.info(f"Run {run_id} cancelado (cancelled_in_prefect={cancelled_in_prefect})")
-    return {"run_id": run_id, "cancelled_in_prefect": cancelled_in_prefect}
+    return ok(CancelResult(run_id=run_id, cancelled_in_prefect=cancelled_in_prefect))
 
 
 # ── Live metrics enrichment ────────────────────────────────────────────────────
 
 def _fetch_live_wandb_metrics(wandb_url: str) -> Optional[dict]:
-    """Consulta el summary de wandb en tiempo real a partir de la URL del run.
-
-    Devuelve un dict con métricas escalares (PSNR, SSIM, LPIPS, gaussian_count,
-    GPU Memory, Train Loss, etc.) o None si falta key, URL inválida o error.
-    """
     if not WANDB_API_KEY:
         return None
     m = _WANDB_RUN_RE.match(wandb_url)
@@ -189,11 +274,6 @@ def _fetch_live_wandb_metrics(wandb_url: str) -> Optional[dict]:
 
 
 def _enrich_with_live_metrics(run: dict) -> dict:
-    """Añade métricas en vivo al dict del run si está en una stage activa.
-
-    Si hay wandb_url en Firestore, consulta el summary en tiempo real y lo
-    sobreescribe en 'wandb_metrics'. El resto de campos del run no se tocan.
-    """
     wandb_url = run.get("wandb_url")
     if wandb_url:
         live = _fetch_live_wandb_metrics(wandb_url)
@@ -209,14 +289,13 @@ def _trigger_prefect_flow(run_id: str, req: PipelineRequest) -> str:
     if not PREFECT_API_URL:
         raise HTTPException(
             status_code=503,
-            detail="PREFECT_API_URL no está configurado.",
+            detail="PREFECT_API_URL is not configured.",
         )
 
     headers = {"Content-Type": "application/json"}
     if PREFECT_API_KEY:
         headers["Authorization"] = f"Bearer {PREFECT_API_KEY}"
 
-    # Obtener deployment ID por nombre
     dep_resp = requests.get(
         f"{PREFECT_API_URL}/deployments/name/{PREFECT_DEPLOYMENT}",
         headers=headers,
@@ -226,11 +305,10 @@ def _trigger_prefect_flow(run_id: str, req: PipelineRequest) -> str:
         logger.error(f"Deployment '{PREFECT_DEPLOYMENT}' no encontrado: {dep_resp.status_code} {dep_resp.text}")
         raise HTTPException(
             status_code=502,
-            detail=f"No se pudo obtener el deployment '{PREFECT_DEPLOYMENT}': {dep_resp.text}",
+            detail=f"Could not retrieve deployment '{PREFECT_DEPLOYMENT}'.",
         )
     deployment_id = dep_resp.json()["id"]
 
-    # Construir parámetros del flow
     params = req.model_dump(exclude={"dataset"})
     preprocess_params = {
         "matching_method":  params.pop("matching_method"),
@@ -241,22 +319,21 @@ def _trigger_prefect_flow(run_id: str, req: PipelineRequest) -> str:
         "skip_colmap":      params.pop("skip_colmap"),
     }
     train_params = {
-        "dataparser":    params.pop("dataparser"),
-        "max_iters":     params.pop("max_iters"),
-        "sh_degree":     params.pop("sh_degree"),
-        "num_random":    params.pop("num_random"),
+        "dataparser":     params.pop("dataparser"),
+        "max_iters":      params.pop("max_iters"),
+        "sh_degree":      params.pop("sh_degree"),
+        "num_random":     params.pop("num_random"),
         "num_downscales": params.pop("num_downscales_train"),
-        "res_schedule":  params.pop("res_schedule"),
-        "densify_grad":  params.pop("densify_grad"),
-        "densify_size":  params.pop("densify_size"),
-        "n_split":       params.pop("n_split"),
-        "refine_every":  params.pop("refine_every"),
-        "cull_scale":    params.pop("cull_scale"),
-        "reset_alpha":   params.pop("reset_alpha"),
-        "use_wandb":     params.pop("use_wandb"),
+        "res_schedule":   params.pop("res_schedule"),
+        "densify_grad":   params.pop("densify_grad"),
+        "densify_size":   params.pop("densify_size"),
+        "n_split":        params.pop("n_split"),
+        "refine_every":   params.pop("refine_every"),
+        "cull_scale":     params.pop("cull_scale"),
+        "reset_alpha":    params.pop("reset_alpha"),
+        "use_wandb":      params.pop("use_wandb"),
     }
 
-    # Crear flow run
     run_resp = requests.post(
         f"{PREFECT_API_URL}/deployments/{deployment_id}/create_flow_run",
         headers=headers,
@@ -277,11 +354,10 @@ def _trigger_prefect_flow(run_id: str, req: PipelineRequest) -> str:
         logger.error(f"Error al crear flow run en Prefect: {run_resp.status_code} {run_resp.text}")
         raise HTTPException(
             status_code=502,
-            detail=f"No se pudo crear el flow run: {run_resp.text}",
+            detail="Could not create Prefect flow run.",
         )
 
-    flow_run_id = run_resp.json()["id"]
-    return flow_run_id
+    return run_resp.json()["id"]
 
 
 def _cancel_prefect_flow(prefect_flow_run_id: str) -> bool:
