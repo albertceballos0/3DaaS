@@ -17,6 +17,7 @@ venv/
 .DS_Store
 
 data/
+logs/
 
 # Binaries / archives
 *.tar.gz

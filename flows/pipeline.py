@@ -32,6 +32,7 @@ from flows.config import PreprocessParams, TrainParams
 from flows.config import BUCKET, GCS_DATASET_PREFIX, PREBUILT_DATA_SUBFOLDER
 from flows.tasks.gcs import (
     detect_dataset_type,
+    validate_dataset_exists,
     validate_exported_output,
     validate_processed_output,
     validate_raw_input,
@@ -50,6 +51,7 @@ _PREBUILT_TYPES = {"nerfstudio", "dnerf", "blender", "instant-ngp"}
 
 # Orden canónico de stages para la lógica de resume
 _STAGE_ORDER = [
+    "validating_dataset",
     "detecting_dataset",
     "validating_raw",
     "preprocessing",
@@ -158,6 +160,11 @@ def gaussian_pipeline(
                 "dataset": dataset,
                 "dataset_type": dataset_type,
             })
+
+        # ── Stage 0: Validar existencia del dataset ───────────────────────────
+        if _reaches("validating_dataset", resume_from_stage):
+            _stage("validating_dataset")
+            validate_dataset_exists(dataset)
 
         # ── Detectar tipo de dataset ───────────────────────────────────────────
         if _reaches("detecting_dataset", resume_from_stage):

@@ -14,6 +14,25 @@ from flows.config import BUCKET, GCS_DATASET_PREFIX
 _IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".JPG", ".JPEG", ".PNG"}
 
 
+@task(name="validate-dataset-exists", log_prints=True)
+def validate_dataset_exists(dataset: str) -> None:
+    """Assert que gs://<BUCKET>/<GCS_DATASET_PREFIX>/<dataset>/ existe (tiene al menos un objeto)."""
+    prefix = f"{GCS_DATASET_PREFIX}/{dataset}/"
+    print(f"Validando existencia del dataset: gs://{BUCKET}/{prefix}")
+
+    client = storage.Client()
+    blobs = list(client.list_blobs(BUCKET, prefix=prefix, max_results=1))
+
+    if not blobs:
+        raise ValueError(
+            f"Dataset '{dataset}' no encontrado en gs://{BUCKET}/{prefix}. "
+            f"Asegúrate de que el dataset existe en el entorno correcto "
+            f"(APP_ENV determina el prefijo: '{GCS_DATASET_PREFIX}/')."
+        )
+
+    print(f"Dataset '{dataset}' encontrado en gs://{BUCKET}/{prefix}")
+
+
 @task(name="detect-dataset-type", log_prints=True)
 def detect_dataset_type(dataset: str) -> str:
     """Inspecciona la estructura GCS y devuelve el tipo de dataset.

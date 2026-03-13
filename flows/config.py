@@ -34,8 +34,8 @@ DATA STRUCTURES — where each piece of information lives
 │  prefect_flow_run_id str     ID del flow run en Prefect
 │
 │  STAGES:
-│    detecting_dataset → validating_raw → preprocessing → validating_processed
-│    → training → validating_exported → null (done/failed)
+│    validating_dataset → detecting_dataset → validating_raw → preprocessing
+│    → validating_processed → training → validating_exported → null (done/failed)
 │
 │  TrainingProgress:
 │    step        int    Paso actual de entrenamiento
