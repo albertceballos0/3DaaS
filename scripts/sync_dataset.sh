@@ -57,7 +57,11 @@ if [[ "$FOLDER_TYPE" != "raw" && "$FOLDER_TYPE" != "data" ]]; then
     exit 1
 fi
 
-GCS_DEST="gs://${GCS_BUCKET}/${DATASET_NAME}/${FOLDER_TYPE}/"
+if [ "$APP_ENV" == "production" ]; then
+    GCS_DEST="gs://${GCS_BUCKET}/pipeline_runs/${DATASET_NAME}/${FOLDER_TYPE}/"
+else
+    GCS_DEST="gs://${GCS_BUCKET}/pipeline_runs_dev/${DATASET_NAME}/${FOLDER_TYPE}/"
+fi
 
 # ── Info ───────────────────────────────────────────────────────────────────────
 FILE_COUNT=$(find "$LOCAL_DIR" -type f | wc -l | tr -d ' ')

@@ -102,14 +102,15 @@ gcloud compute scp --recurse \
     "${VM_NAME}:${REMOTE_DIR_ABS}/"
 success "Código sincronizado"
 
-# ── 4. Copiar .env ────────────────────────────────────────────────────────────
-info "Copiando .env..."
-gcloud compute scp \
-    --zone="${VM_ZONE}" \
-    --project="${PROJECT_ID}" \
-    "${ENV_FILE}" \
-    "${VM_NAME}:${REMOTE_DIR_ABS}/.env"
-success ".env copiado"
+# ── 4. Verificar que existe .env en la VM ─────────────────────────────────────
+info "Verificando .env en la VM..."
+if ! vm_exec "test -f '${REMOTE_DIR_ABS}/.env'"; then
+    warn ".env NO encontrado en la VM (${REMOTE_DIR_ABS}/.env)"
+    warn "Crea el .env en la VM antes de continuar:"
+    warn "  gcloud compute ssh ${VM_NAME} --zone=${VM_ZONE} --command='cp ${REMOTE_DIR_ABS}/.env.example ${REMOTE_DIR_ABS}/.env && nano ${REMOTE_DIR_ABS}/.env'"
+    error "Abortando: configura el .env en la VM primero."
+fi
+success ".env presente en la VM (no se sobreescribe)"
 
 # ── 5. Copiar service account key (si existe localmente) ─────────────────────
 if [ -n "$SA_KEY_PATH" ] && [ -f "${REPO_ROOT}/${SA_KEY_PATH#./}" ]; then

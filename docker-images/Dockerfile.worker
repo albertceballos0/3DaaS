@@ -32,10 +32,12 @@ RUN pip install --no-cache-dir -r flows/requirements.txt
 # Copiar código fuente
 COPY flows/ flows/
 COPY api/ api/
+COPY utils/ utils/
 COPY prefect.yaml prefect.yaml
 
 # Script de arranque
 COPY scripts/start_worker.sh /start_worker.sh
+COPY scripts/recover_stale_runs.py scripts/recover_stale_runs.py
 RUN chmod +x /start_worker.sh
 
 CMD ["/start_worker.sh"]

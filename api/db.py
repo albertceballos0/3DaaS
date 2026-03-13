@@ -18,15 +18,18 @@ Schema per document:
   params        dict      — full copy of all pipeline parameters
 
 Usage:
-  from api.db import create_run, update_run, get_run, list_runs
+  from api.db import create_run, update_run, get_run, list_runs, delete_run
 """
 from __future__ import annotations
 
+import os
 from functools import lru_cache
+from typing import Optional
 
 from google.cloud import firestore
 
-COLLECTION = "pipeline_runs"
+_APP_ENV = os.environ.get("APP_ENV", "production")
+COLLECTION = "pipeline_runs" if _APP_ENV == "production" else "pipeline_runs_dev"
 
 
 @lru_cache(maxsize=1)
@@ -49,6 +52,11 @@ def create_run(run_id: str, data: dict) -> None:
 def update_run(run_id: str, updates: dict) -> None:
     """Partial update of an existing run document."""
     _col().document(run_id).update(updates)
+
+
+def delete_run(run_id: str) -> None:
+    """Delete a run document from Firestore."""
+    _col().document(run_id).delete()
 
 
 # ── Read operations ───────────────────────────────────────────────────────────

@@ -4,10 +4,11 @@ api/main.py
 FastAPI gateway para el pipeline 3DaaS Gaussian Splatting.
 
 Endpoints públicos:
-  POST /pipeline/start    → dispara un Prefect flow run (retorna run_id)
-  GET  /pipeline/{run_id} → estado del run (leído desde Firestore)
-  GET  /pipeline          → lista de runs (paginada)
-  GET  /health            → health check
+  POST   /pipeline/start    → dispara un Prefect flow run (retorna run_id)
+  GET    /pipeline/{run_id} → estado del run (leído desde Firestore)
+  GET    /pipeline          → lista de runs (paginada)
+  DELETE /pipeline/{run_id} → cancela el flow run en Prefect y elimina de Firestore
+  GET    /health            → health check
 
 El estado del pipeline es escrito directamente en Firestore por el Prefect flow
 que corre en el worker. La API solo lee el estado y dispara nuevos runs.
@@ -19,10 +20,11 @@ Run:
 from __future__ import annotations
 
 import os
+import re
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 
 import requests
 from fastapi import FastAPI, HTTPException, Query
@@ -32,6 +34,10 @@ from dotenv import load_dotenv
 # ── Bootstrap ─────────────────────────────────────────────────────────────────
 load_dotenv(Path(__file__).parent.parent / ".env")
 
+from utils.logger import get_logger, setup_logging
+setup_logging("api")
+logger = get_logger("api")
+
 import api.db as db
 
 app = FastAPI(title="3DaaS Pipeline API", version="4.0.0")
@@ -39,6 +45,12 @@ app = FastAPI(title="3DaaS Pipeline API", version="4.0.0")
 PREFECT_API_URL = os.environ.get("PREFECT_API_URL", "")
 PREFECT_API_KEY = os.environ.get("PREFECT_API_KEY", "")
 PREFECT_DEPLOYMENT = os.environ.get("PREFECT_DEPLOYMENT", "gaussian-pipeline/prod")
+WANDB_API_KEY = os.environ.get("WANDB_API_KEY", "")
+
+_WANDB_RUN_RE = re.compile(r'https://wandb\.ai/([^/\s]+)/([^/\s]+)/runs/([^/\s?#]+)')
+
+# Stages en los que tiene sentido consultar métricas en vivo
+_LIVE_METRIC_STAGES = {"training", "preprocessing"}
 
 
 # ── Models ────────────────────────────────────────────────────────────────────
@@ -75,6 +87,7 @@ class PipelineRequest(BaseModel):
     refine_every: int = 100
     cull_scale: float = 0.5
     reset_alpha: int = 30
+    use_wandb: bool = False
 
 
 # ── Public routes ──────────────────────────────────────────────────────────────
@@ -100,8 +113,10 @@ def start_pipeline(req: PipelineRequest):
     }
 
     db.create_run(run_id, run_data)
+    logger.info(f"Run creado: {run_id} dataset={req.dataset} type={req.dataset_type}")
     prefect_run_id = _trigger_prefect_flow(run_id, req)
     db.update_run(run_id, {"prefect_flow_run_id": prefect_run_id})
+    logger.debug(f"Flow run de Prefect creado: {prefect_run_id} para run {run_id}")
     return db.get_run(run_id)
 
 
@@ -115,6 +130,75 @@ def get_run(run_id: str):
     run = db.get_run(run_id)
     if not run:
         raise HTTPException(status_code=404, detail="Run not found")
+    if run.get("stage") in _LIVE_METRIC_STAGES:
+        run = _enrich_with_live_metrics(run)
+    return run
+
+
+@app.delete("/pipeline/{run_id}", status_code=200)
+def cancel_run(run_id: str):
+    run = db.get_run(run_id)
+    if not run:
+        raise HTTPException(status_code=404, detail="Run not found")
+
+    # Cancelar en Prefect si hay un flow run asociado y aún está activo
+    prefect_flow_run_id = run.get("prefect_flow_run_id")
+    cancelled_in_prefect = False
+    if prefect_flow_run_id and run.get("status") not in ("done", "failed", "cancelled"):
+        cancelled_in_prefect = _cancel_prefect_flow(prefect_flow_run_id)
+
+    db.update_run(run_id, {
+        "status":       "cancelled",
+        "completed_at": datetime.now(timezone.utc).isoformat(),
+        "error":        "Cancelled by user",
+    })
+    logger.info(f"Run {run_id} cancelado (cancelled_in_prefect={cancelled_in_prefect})")
+    return {"run_id": run_id, "cancelled_in_prefect": cancelled_in_prefect}
+
+
+# ── Live metrics enrichment ────────────────────────────────────────────────────
+
+def _fetch_live_wandb_metrics(wandb_url: str) -> Optional[dict]:
+    """Consulta el summary de wandb en tiempo real a partir de la URL del run.
+
+    Devuelve un dict con métricas escalares (PSNR, SSIM, LPIPS, gaussian_count,
+    GPU Memory, Train Loss, etc.) o None si falta key, URL inválida o error.
+    """
+    if not WANDB_API_KEY:
+        return None
+    m = _WANDB_RUN_RE.match(wandb_url)
+    if not m:
+        return None
+    entity, project, run_id = m.groups()
+    try:
+        import wandb
+        api = wandb.Api(api_key=WANDB_API_KEY, timeout=10)
+        run = api.run(f"{entity}/{project}/{run_id}")
+        source = dict(run.summary)
+        if not source:
+            hist = run.history(last=1, pandas=False)
+            source = hist[0] if hist else {}
+        return {
+            k: round(v, 6) if isinstance(v, float) else v
+            for k, v in source.items()
+            if not k.startswith("_") and isinstance(v, (int, float))
+        } or None
+    except Exception as exc:
+        logger.warning(f"No se pudieron obtener métricas de wandb ({wandb_url}): {exc}")
+        return None
+
+
+def _enrich_with_live_metrics(run: dict) -> dict:
+    """Añade métricas en vivo al dict del run si está en una stage activa.
+
+    Si hay wandb_url en Firestore, consulta el summary en tiempo real y lo
+    sobreescribe en 'wandb_metrics'. El resto de campos del run no se tocan.
+    """
+    wandb_url = run.get("wandb_url")
+    if wandb_url:
+        live = _fetch_live_wandb_metrics(wandb_url)
+        if live:
+            run = {**run, "wandb_metrics": live}
     return run
 
 
@@ -139,6 +223,7 @@ def _trigger_prefect_flow(run_id: str, req: PipelineRequest) -> str:
         timeout=10,
     )
     if dep_resp.status_code != 200:
+        logger.error(f"Deployment '{PREFECT_DEPLOYMENT}' no encontrado: {dep_resp.status_code} {dep_resp.text}")
         raise HTTPException(
             status_code=502,
             detail=f"No se pudo obtener el deployment '{PREFECT_DEPLOYMENT}': {dep_resp.text}",
@@ -168,6 +253,7 @@ def _trigger_prefect_flow(run_id: str, req: PipelineRequest) -> str:
         "refine_every":  params.pop("refine_every"),
         "cull_scale":    params.pop("cull_scale"),
         "reset_alpha":   params.pop("reset_alpha"),
+        "use_wandb":     params.pop("use_wandb"),
     }
 
     # Crear flow run
@@ -188,6 +274,7 @@ def _trigger_prefect_flow(run_id: str, req: PipelineRequest) -> str:
         timeout=10,
     )
     if run_resp.status_code not in (200, 201):
+        logger.error(f"Error al crear flow run en Prefect: {run_resp.status_code} {run_resp.text}")
         raise HTTPException(
             status_code=502,
             detail=f"No se pudo crear el flow run: {run_resp.text}",
@@ -195,3 +282,22 @@ def _trigger_prefect_flow(run_id: str, req: PipelineRequest) -> str:
 
     flow_run_id = run_resp.json()["id"]
     return flow_run_id
+
+
+def _cancel_prefect_flow(prefect_flow_run_id: str) -> bool:
+    """Envía señal de cancelación a un Prefect flow run. Retorna True si se canceló."""
+    if not PREFECT_API_URL:
+        return False
+    headers = {"Content-Type": "application/json"}
+    if PREFECT_API_KEY:
+        headers["Authorization"] = f"Bearer {PREFECT_API_KEY}"
+    try:
+        resp = requests.post(
+            f"{PREFECT_API_URL}/flow_runs/{prefect_flow_run_id}/set_state",
+            headers=headers,
+            json={"state": {"type": "CANCELLING"}, "force": True},
+            timeout=10,
+        )
+        return resp.status_code in (200, 201)
+    except Exception:
+        return False

@@ -22,7 +22,12 @@ echo "==> Creating work pool '${WORK_POOL}' (if not exists)..."
 prefect work-pool create "${WORK_POOL}" --type process 2>/dev/null || true
 
 echo "==> Registering deployment..."
-prefect deploy --name prod --prefect-file /app/prefect.yaml
+prefect deploy --all --prefect-file /app/prefect.yaml
+
+# Recovery DESPUÉS del deploy: necesita el deployment registrado para poder
+# crear nuevos flow runs que reanuden los runs interrumpidos.
+echo "==> Recovering stale runs from previous worker crash..."
+python /app/scripts/recover_stale_runs.py || echo "WARNING: stale run recovery failed (non-fatal)"
 
 echo "==> Starting worker for pool '${WORK_POOL}'..."
 exec prefect worker start --pool "${WORK_POOL}"

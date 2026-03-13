@@ -44,12 +44,14 @@ services:
     build:
       context: .
       dockerfile: docker-images/Dockerfile.worker
+    restart: unless-stopped
     depends_on:
       prefect-server:
         condition: service_healthy
     environment:
       PREFECT_API_URL: "http://prefect-server:4200/api"
       PREFECT_WORK_POOL: "gcp-worker"
+      APP_ENV:             "${APP_ENV:-local}"
       # GCP config — cargado desde .env
       GCP_PROJECT_ID:      "${GCP_PROJECT_ID}"
       GCP_REGION:          "${GCP_REGION}"
@@ -57,22 +59,29 @@ services:
       GCP_SERVICE_ACCOUNT: "${GCP_SERVICE_ACCOUNT}"
       IMAGE_PREPROCESS:    "${IMAGE_PREPROCESS}"
       IMAGE_TRAIN:         "${IMAGE_TRAIN}"
+      WANDB_API_KEY:       "${WANDB_API_KEY:-}"
+      WEBHOOK_URL:         "${WEBHOOK_URL:-}"
+      PYTHONUNBUFFERED:    "1"
       GOOGLE_APPLICATION_CREDENTIALS: "/secrets/sa-key.json"
     volumes:
       # Monta la service account key para autenticación GCP
       - "${GCP_SA_KEY_PATH:-./skillful-air-480018-f2-bcb000b8c0e2.json}:/secrets/sa-key.json:ro"
+      - ./logs:/app/logs
+      - ./utils:/app/utils
 
   # ── FastAPI Gateway ───────────────────────────────────────────────────────────
   api:
     build:
       context: .
       dockerfile: docker-images/Dockerfile.api
+    restart: unless-stopped
     ports:
       - "8080:8080"
     depends_on:
       prefect-server:
         condition: service_healthy
     environment:
+      APP_ENV:             "${APP_ENV:-local}"
       GCP_PROJECT_ID:      "${GCP_PROJECT_ID}"
       GCP_REGION:          "${GCP_REGION}"
       GCS_BUCKET:          "${GCS_BUCKET}"
@@ -83,9 +92,13 @@ services:
       PREFECT_API_URL:     "http://prefect-server:4200/api"
       PREFECT_API_KEY:     ""
       PREFECT_DEPLOYMENT:  "gaussian-pipeline/prod"
+      PYTHONUNBUFFERED:    "1"
       GOOGLE_APPLICATION_CREDENTIALS: "/secrets/sa-key.json"
     volumes:
       - "${GCP_SA_KEY_PATH:-./skillful-air-480018-f2-bcb000b8c0e2.json}:/secrets/sa-key.json:ro"
+      # Logs persistentes — accesibles desde el host en ./logs/api/
+      - ./logs:/app/logs
+      - ./utils:/app/utils
 
 volumes:
   prefect-data:

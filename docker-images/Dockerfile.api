@@ -19,6 +19,7 @@ COPY --from=builder /install /usr/local
 # Copy application source
 COPY api/   api/
 COPY flows/ flows/
+COPY utils/ utils/
 
 # Cloud Run injects PORT; default to 8080
 ENV PORT=8080

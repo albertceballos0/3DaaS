@@ -2,6 +2,16 @@
 
 Pipeline automatizado para procesar imágenes y generar archivos `.ply` de Gaussian Splats 3D usando **Nerfstudio (splatfacto)** en **Google Cloud Vertex AI**, orquestado con **Prefect**.
 
+## Documentación detallada
+
+| Documento | Contenido |
+|---|---|
+| [docs/architecture.md](docs/architecture.md) | Arquitectura completa, diagramas Mermaid, flujo de datos, módulos |
+| [docs/pipeline.md](docs/pipeline.md) | Stages, parámetros, Vertex AI jobs, Firestore schema, webhooks, recovery |
+| [docs/development.md](docs/development.md) | Setup local, tests, logs, hot reload, debugging |
+| [docs/deployment.md](docs/deployment.md) | Deploy GCE VM, CI/CD, IAM, gestión de la VM |
+| [docs/commands.md](docs/commands.md) | Referencia completa de todos los comandos CLI |
+
 ---
 
 ## Índice
@@ -16,9 +26,12 @@ Pipeline automatizado para procesar imágenes y generar archivos `.ply` de Gauss
 8. [GCS — Layout de datos](#gcs--layout-de-datos)
 9. [Imágenes Docker](#imágenes-docker)
 10. [Monitoreo y debugging](#monitoreo-y-debugging)
-11. [Service Account & IAM](#service-account--iam)
-12. [Seguridad](#seguridad)
-13. [GCP Resources](#gcp-resources)
+11. [Logs del sistema](#logs-del-sistema)
+12. [Entornos — local vs producción](#entornos--local-vs-producción)
+13. [Recuperación de runs interrumpidos](#recuperación-de-runs-interrumpidos)
+14. [Service Account & IAM](#service-account--iam)
+15. [Seguridad](#seguridad)
+16. [GCP Resources](#gcp-resources)
 
 ---
 
@@ -107,10 +120,13 @@ Cliente (Laravel / curl)
 │   └── Dockerimage-process  # Imagen COLMAP preprocessing (subida a Vertex AI)
 │
 ├── scripts/
-│   ├── start_worker.sh      # Entrypoint del worker: crea pool → registra deployment → arranca
-│   ├── deploy_vm.sh         # Deploy completo a GCE VM via gcloud
-│   ├── run_preprocess_job.sh  # Submit manual Stage 1 (COLMAP)
-│   └── run_train_job.sh       # Submit manual Stage 2 (training)
+│   ├── start_worker.sh           # Entrypoint del worker: crea pool → registra deployment → arranca
+│   ├── deploy_vm.sh              # Deploy completo a GCE VM via gcloud
+│   ├── sync_dataset.sh           # Sube imágenes/datasets a GCS
+│   ├── recover_stale_runs.py     # Reanuda runs interrumpidos al arrancar el worker
+│   └── tasks/
+│       ├── run_preprocess_job.sh  # Submit manual Stage 1 (COLMAP)
+│       └── run_train_job.sh       # Submit manual Stage 2 (training)
 │
 ├── specs/
 │   ├── preprocess_spec.json    # Vertex AI spec: n1-highmem-16, CPU
@@ -454,6 +470,76 @@ docker push us-central1-docker.pkg.dev/skillful-air-480018-f2/nerfstudio-repo/im
 
 ```bash
 ./sync_official_image.sh
+```
+
+---
+
+## Logs del sistema
+
+Cada contenedor escribe logs estructurados en `./logs/` (montado como volumen):
+
+```
+logs/
+├── worker/
+│   ├── app.log       # INFO+ — actividad general del worker
+│   ├── error.log     # ERROR+ — solo errores (retención 60 días)
+│   └── debug.log     # DEBUG+ — verbose, solo en local (retención 7 días)
+└── api/
+    ├── app.log
+    └── error.log
+```
+
+```bash
+# En local
+docker compose logs -f prefect-worker
+tail -f logs/worker/error.log
+grep "<run_id>" logs/worker/app.log
+
+# En producción
+gcloud compute ssh vm-3daas --zone=us-central1-a \
+  --command="cd ~/3daas && docker compose logs -f prefect-worker --tail=100"
+```
+
+El nivel de log por consola depende de `APP_ENV`:
+- `local` → `DEBUG` (verbose, ideal para desarrollo)
+- `production` → `INFO`
+
+---
+
+## Entornos — local vs producción
+
+El sistema usa `APP_ENV` para separar completamente los datos:
+
+| Variable | `local` | `production` |
+|---|---|---|
+| `APP_ENV` | `local` | `production` |
+| Colección Firestore | `pipeline_runs_dev` | `pipeline_runs` |
+| Nivel de log consola | `DEBUG` | `INFO` |
+| Fichero debug.log | Sí | No |
+
+Cambiar de entorno: editar `APP_ENV` en `.env` y reiniciar los contenedores.
+
+---
+
+## Recuperación de runs interrumpidos
+
+Si el worker cae (OOM, reinicio, deploy), al volver a arrancar ejecuta automáticamente `scripts/recover_stale_runs.py`:
+
+1. Busca en Firestore todos los runs con `status == "running"`
+2. Cancela el flow run anterior en Prefect (evita duplicados)
+3. Para runs en una stage de Vertex AI, comprueba el estado del job en GCP:
+   - `JOB_STATE_SUCCEEDED` → reanuda desde el siguiente stage de validación
+   - `RUNNING/PENDING` → reanuda el polling del mismo job
+   - Otro estado → re-submitirá el job
+4. Crea un nuevo flow run en Prefect con `resume_from_stage`
+5. Actualiza Firestore a `status=queued`
+
+El pipeline retoma exactamente donde se quedó — no repite trabajo ya completado en Vertex AI.
+
+Para ejecutarlo manualmente:
+
+```bash
+docker compose exec prefect-worker python /app/scripts/recover_stale_runs.py
 ```
 
 ---

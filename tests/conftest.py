@@ -54,3 +54,11 @@ def mock_job_service_client(monkeypatch):
     mock_client = MagicMock()
     monkeypatch.setattr("flows.tasks.vertex._job_service_client", lambda: mock_client)
     return mock_client
+
+
+@pytest.fixture(autouse=True)
+def _mock_vertex_side_effects(monkeypatch):
+    """Auto-patch send_webhook, _fetch_vertex_logs, and db in vertex tasks."""
+    monkeypatch.setattr("flows.tasks.vertex.send_webhook", MagicMock())
+    monkeypatch.setattr("flows.tasks.vertex._fetch_vertex_logs", lambda *a, **kw: ([], None))
+    monkeypatch.setattr("flows.tasks.vertex.db", MagicMock())

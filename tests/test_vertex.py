@@ -11,7 +11,10 @@ from unittest.mock import MagicMock
 from google.cloud.aiplatform_v1.types import JobState
 from google.api_core.exceptions import ServiceUnavailable, InternalServerError
 
-from flows.tasks.vertex import poll_vertex_job, submit_preprocess_job, submit_train_job
+from flows.tasks.vertex import (
+    poll_vertex_job, submit_preprocess_job, submit_train_job,
+    _parse_train_progress,
+)
 from flows.config import PreprocessParams, TrainParams
 
 DATASET  = "test_scene"
@@ -93,6 +96,156 @@ class TestPollJob:
         monkeypatch.setattr("flows.tasks.vertex.time.sleep", lambda _: None)
         poll_vertex_job.fn(RESOURCE, poll_interval=0)
         assert len(clients) == 3
+
+
+class TestParseTrainProgress:
+    def test_parses_step_and_total(self):
+        logs = ["[step 3000/30000] training..."]
+        p = _parse_train_progress(logs)
+        assert p is not None
+        assert p["step"] == 3000
+        assert p["total_steps"] == 30000
+        assert p["pct"] == 10.0
+
+    def test_parses_loss(self):
+        logs = ["step 1500/30000 Loss: 0.0234"]
+        p = _parse_train_progress(logs)
+        assert p["train_loss"] == pytest.approx(0.0234)
+
+    def test_parses_train_loss_key(self):
+        logs = ["[step: 001000/030000] train_loss=0.0567"]
+        p = _parse_train_progress(logs)
+        assert p["step"] == 1000
+        assert p["train_loss"] == pytest.approx(0.0567)
+
+    def test_returns_most_recent_step(self):
+        logs = [
+            "step 1000/30000 Loss: 0.05",
+            "step 2000/30000 Loss: 0.04",
+        ]
+        p = _parse_train_progress(logs)
+        assert p["step"] == 2000
+
+    def test_returns_none_on_no_match(self):
+        assert _parse_train_progress([]) is None
+        assert _parse_train_progress(["COLMAP done", "Writing transforms.json"]) is None
+
+    def test_pct_rounded_to_one_decimal(self):
+        logs = ["step 1/3 loss=0.01"]
+        p = _parse_train_progress(logs)
+        assert p["pct"] == round(1 / 3 * 100, 1)
+
+    # ── Formato nerfstudio rich output (Cloud Logging real) ──────────────────
+
+    def test_parses_nerfstudio_rich_format(self):
+        logs = ["4350 (14.50%)       68.353 ms            29 m, 13 s           9.36 M"]
+        p = _parse_train_progress(logs)
+        assert p is not None
+        assert p["step"] == 4350
+        assert p["pct"] == 14.5
+        assert p["total_steps"] == 30000
+
+    def test_parses_nerfstudio_rich_with_ansi(self):
+        logs = ["4350 (14.50%)       68.353 ms            29 m, 13 s           9.36 M\x1b[0m"]
+        p = _parse_train_progress(logs)
+        assert p is not None
+        assert p["step"] == 4350
+        assert p["pct"] == 14.5
+
+    def test_nerfstudio_rich_infers_total_steps(self):
+        # step=15000, pct=50.0 → total=30000
+        logs = ["15000 (50.00%)   45.2 ms   15 m, 0 s   10.1 M"]
+        p = _parse_train_progress(logs)
+        assert p["total_steps"] == 30000
+
+    def test_nerfstudio_rich_returns_most_recent(self):
+        logs = [
+            "1000 (3.33%)    60 ms  ...",
+            "4350 (14.50%)   68 ms  ...",
+        ]
+        p = _parse_train_progress(logs)
+        assert p["step"] == 4350
+
+
+class TestPollJobWithRunId:
+    def test_updates_firestore_with_vertex_job_id(self, mock_job_service_client, monkeypatch):
+        mock_db = MagicMock()
+        monkeypatch.setattr("flows.tasks.vertex.db", mock_db)
+        mock_job_service_client.get_custom_job.return_value = make_job(JobState.JOB_STATE_SUCCEEDED)
+
+        poll_vertex_job.fn(RESOURCE, run_id="run-1", poll_interval=0)
+
+        first_call_data = mock_db.update_run.call_args_list[0][0][1]
+        assert first_call_data.get("vertex_job_id") == "456"
+
+    def test_sends_job_submitted_webhook(self, mock_job_service_client, monkeypatch):
+        mock_webhook = MagicMock()
+        monkeypatch.setattr("flows.tasks.vertex.send_webhook", mock_webhook)
+        mock_job_service_client.get_custom_job.return_value = make_job(JobState.JOB_STATE_SUCCEEDED)
+
+        poll_vertex_job.fn(RESOURCE, run_id="run-1", job_type="train", poll_interval=0)
+
+        events = [c[0][0] for c in mock_webhook.call_args_list]
+        assert "job_submitted" in events
+        assert "job_completed" in events
+
+    def test_sends_job_failed_webhook_on_failure(self, mock_job_service_client, monkeypatch):
+        mock_webhook = MagicMock()
+        monkeypatch.setattr("flows.tasks.vertex.send_webhook", mock_webhook)
+        mock_job_service_client.get_custom_job.return_value = make_job(JobState.JOB_STATE_FAILED)
+
+        with pytest.raises(RuntimeError):
+            poll_vertex_job.fn(RESOURCE, run_id="run-1", poll_interval=0)
+
+        events = [c[0][0] for c in mock_webhook.call_args_list]
+        assert "job_failed" in events
+
+    def test_no_firestore_calls_without_run_id(self, mock_job_service_client, monkeypatch):
+        mock_db = MagicMock()
+        monkeypatch.setattr("flows.tasks.vertex.db", mock_db)
+        mock_job_service_client.get_custom_job.return_value = make_job(JobState.JOB_STATE_SUCCEEDED)
+
+        poll_vertex_job.fn(RESOURCE, poll_interval=0)
+
+        mock_db.update_run.assert_not_called()
+
+    def test_heartbeat_webhook_sent_while_running(self, mock_job_service_client, monkeypatch):
+        mock_webhook = MagicMock()
+        monkeypatch.setattr("flows.tasks.vertex.send_webhook", mock_webhook)
+        monkeypatch.setattr("flows.tasks.vertex.time.sleep", lambda _: None)
+        monkeypatch.setattr(
+            "flows.tasks.vertex._fetch_vertex_logs",
+            lambda job_id, since=None: (["step 3000/30000 Loss: 0.02"], None),
+        )
+        mock_job_service_client.get_custom_job.side_effect = [
+            make_job(JobState.JOB_STATE_RUNNING),
+            make_job(JobState.JOB_STATE_SUCCEEDED),
+        ]
+
+        poll_vertex_job.fn(RESOURCE, run_id="run-1", job_type="train", poll_interval=0)
+
+        events = [c[0][0] for c in mock_webhook.call_args_list]
+        assert "job_heartbeat" in events
+        hb = next(c for c in mock_webhook.call_args_list if c[0][0] == "job_heartbeat")
+        assert hb[0][1]["progress"]["step"] == 3000
+        assert hb[0][1]["progress"]["pct"] == 10.0
+        assert hb[0][1]["state"] == "JOB_STATE_RUNNING"
+
+    def test_heartbeat_sent_every_running_poll(self, mock_job_service_client, monkeypatch):
+        mock_webhook = MagicMock()
+        monkeypatch.setattr("flows.tasks.vertex.send_webhook", mock_webhook)
+        monkeypatch.setattr("flows.tasks.vertex.time.sleep", lambda _: None)
+        mock_job_service_client.get_custom_job.side_effect = [
+            make_job(JobState.JOB_STATE_RUNNING),
+            make_job(JobState.JOB_STATE_RUNNING),
+            make_job(JobState.JOB_STATE_RUNNING),
+            make_job(JobState.JOB_STATE_SUCCEEDED),
+        ]
+
+        poll_vertex_job.fn(RESOURCE, run_id="run-1", poll_interval=0)
+
+        heartbeats = [c for c in mock_webhook.call_args_list if c[0][0] == "job_heartbeat"]
+        assert len(heartbeats) == 3
 
 
 class TestSubmitPreprocessJob:

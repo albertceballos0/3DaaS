@@ -84,24 +84,18 @@ jobs:
             docker-compose.yml prefect.yaml requirements.txt \
             "$VM_NAME:$REMOTE_DIR/"
 
-      # Escribe el .env en la VM desde los secrets de GitHub
-      - name: Write .env on VM
+      # Verifica que el .env existe en la VM (el usuario lo configura manualmente)
+      - name: Check .env exists on VM
         run: |
           gcloud compute ssh "$VM_NAME" \
             --zone="$VM_ZONE" --project="$PROJECT_ID" \
-            --command="cat > $REMOTE_DIR/.env << 'ENVEOF'
-          GCP_PROJECT_ID=${{ env.PROJECT_ID }}
-          GCP_REGION=${{ env.REGION }}
-          GCS_BUCKET=${{ secrets.GCS_BUCKET }}
-          GCP_SERVICE_ACCOUNT=${{ secrets.GCP_SERVICE_ACCOUNT }}
-          IMAGE_PREPROCESS=${{ secrets.IMAGE_PREPROCESS }}
-          IMAGE_TRAIN=${{ secrets.IMAGE_TRAIN }}
-          GCP_SA_KEY_PATH=
-          PREFECT_API_URL=http://136.116.117.163:4200/api
-          PREFECT_API_KEY=
-          PREFECT_DEPLOYMENT=gaussian-pipeline/prod
-          WEBHOOK_URL=${{ secrets.WEBHOOK_URL }}
-          ENVEOF"
+            --command="
+              if [ ! -f $REMOTE_DIR/.env ]; then
+                echo '::error::No existe $REMOTE_DIR/.env en la VM. Configúralo manualmente antes del primer deploy.'
+                exit 1
+              fi
+              echo '.env encontrado en la VM'
+            "
 
       # Instala Docker si no está (idempotente)
       - name: Ensure Docker is installed
